@@ -250,27 +250,23 @@ def upload():
 @app.route("/api/edit", methods=["POST"])
 def edit():
     data = request.json or {}
-    file_id = data.get("file_id")
-    plan = data.get("plan")
-    if not file_id or not plan:
-        return jsonify({"error": "Missing file_id or plan"}), 400
-    input_path = UPLOAD_FOLDER / file_id
-    if not input_path.exists():
-        return jsonify({"error": "Uploaded video not found"}), 404
-    job_id = uuid.uuid4().hex
-    out_name = f"edited_{job_id}.mp4"
-    output_path = OUTPUT_FOLDER / out_name
-    jobs[job_id] = {
-        "status": "processing",
-        "progress": 0,
-        "status_text": "Starting...",
-        "output_file": None,
-        "error": None
-    }
-    t = threading.Thread(target=apply_edits, args=(input_path, output_path, plan, job_id))
-    t.daemon = True
-    t.start()
-    return jsonify({"job_id": job_id})
+    fid, plan = data.get("file_id"), data.get("plan")
+    if not fid or not plan: return jsonify({"error":"Missing data"}), 400
+    inp = UPLOAD_FOLDER / fid
+    if not inp.exists(): return jsonify({"error":"File not found"}), 404
+    
+    jid = uuid.uuid4().hex
+    out = OUTPUT_FOLDER / f"edited_{jid}.mp4"
+    jobs[jid] = {"status":"processing","progress":0,"status_text":"Starting...","output_file":None,"error":None}
+    
+    # Smart routing: Use 2-step for videos > 30MB (avoids memory crashes)
+    file_size_mb = inp.stat().st_size / (1024 * 1024)
+    if file_size_mb > 30:
+        threading.Thread(target=apply_edits_two_step, args=(inp, out, plan, jid), daemon=True).start()
+    else:
+        threading.Thread(target=apply_edits, args=(inp, out, plan, jid), daemon=True).start()
+    
+    return jsonify({"job_id": jid})
  
 @app.route("/api/status/<job_id>")
 def status(job_id):
