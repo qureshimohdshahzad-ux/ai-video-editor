@@ -2,14 +2,9 @@ services:
   - type: web
     name: ai-video-editor
     runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 600 --workers 1
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn app:app"
     envVars:
       - key: GROQ_API_KEY
         sync: false
-      - key: PORT
-        value: 10000
-    disk:
-      name: video-storage
-      mountPath: /opt/render/project/src
-      sizeGB: 10
+ 
