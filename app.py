@@ -175,7 +175,52 @@ def apply_edits(input_path, output_path, plan, job_id):
         traceback.print_exc()
  
 # ── Routes ───────────────────────────────────────────────────────────────────
- 
+ def apply_edits_two_step(inp, out, plan, job_id):
+    try:
+        # STEP 1: Pre-process to lightweight intermediate (saves memory!)
+        jobs[job_id].update({"progress":10,"status_text":"Step 1/2: Optimizing video..."})
+        temp_file = TEMP_FOLDER / f"temp_{job_id}.mp4"
+        
+        # First pass: Resize to 1080p max, reduce bitrate (memory-friendly)
+        pre_cmd = [
+            "ffmpeg", "-y", "-i", str(inp),
+            "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+            "-c:a", "aac", "-b:a", "128k",
+            str(temp_file)
+        ]
+        
+        ok, err = run_cmd(pre_cmd, timeout=300)
+        if not ok:
+            jobs[job_id].update({"status":"error","error":f"Step 1 failed: {err}"})
+            return
+        
+        # STEP 2: Apply AI filters on smaller file
+        jobs[job_id].update({"progress":50,"status_text":"Step 2/2: Applying AI effects..."})
+        vf = build_filters(plan)
+        
+        final_cmd = [
+            "ffmpeg", "-y", "-i", str(temp_file),
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "copy",
+            "-movflags", "+faststart", str(out)
+        ]
+        
+        ok, err = run_cmd(final_cmd, timeout=300)
+        
+        # Cleanup temp file immediately to free space
+        if temp_file.exists():
+            temp_file.unlink()
+            
+        if not ok:
+            jobs[job_id].update({"status":"error","error":f"Step 2 failed: {err}"})
+            return
+            
+        jobs[job_id].update({"status":"done","progress":100,"status_text":"Ready!","output_file":str(out)})
+        
+    except Exception as e:
+        jobs[job_id].update({"status":"error","error":str(e)})
 @app.route("/")
 def index():
     return render_template_string(HTML_PAGE)
