@@ -4,27 +4,29 @@ from flask import Flask, request, jsonify, send_file, render_template_string
 from werkzeug.utils import secure_filename
 from groq import Groq
 
-# --- CONFIGURATION ---
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+APP_VERSION = "3.0-lowcpu"
+START_TIME = time.time()
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "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")
 
-# Define Folders
 UPLOAD_FOLDER = Path("/tmp/uploads")
 OUTPUT_FOLDER = Path("/tmp/outputs")
 TEMP_FOLDER = Path("/tmp/temp_processing")
-
-# Create all folders on startup
-for folder in [UPLOAD_FOLDER, OUTPUT_FOLDER, TEMP_FOLDER]:
-    folder.mkdir(exist_ok=True)
+UPLOAD_FOLDER.mkdir(exist_ok=True)
+OUTPUT_FOLDER.mkdir(exist_ok=True)
+TEMP_FOLDER.mkdir(exist_ok=True)
 
 ALLOWED_EXTENSIONS = {"mp4", "mov", "avi", "mkv", "webm"}
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024
 
-# Initialize Groq Client
-groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+groq_client = None
+if GROQ_API_KEY:
+    try:
+        groq_client = Groq(api_key=GROQ_API_KEY)
+    except Exception as e:
+        print(f"Groq init error: {e}")
 
-# In-memory job store
 jobs = {}
 
 def allowed_file(f):
@@ -33,22 +35,36 @@ def allowed_file(f):
 def run_cmd(cmd, timeout=600):
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.returncode == 0, r.stderr
+        return r.returncode == 0, (r.stderr or "")
     except Exception as e:
         return False, str(e)
 
-def analyze_with_groq(command_text, ref_url=""):
-    if not groq_client:
-        return {"error": "Groq API Key missing"}
+# Run ffmpeg/ffprobe at LOW CPU priority so the web server never starves
+def ff(cmd, timeout=600):
+    return run_cmd(["nice","-n","19"] + cmd, timeout=timeout)
 
-    system_prompt = """You are an expert video editor AI. Respond ONLY with valid JSON, no markdown.
-Format:
-{"niche":"fitness","niche_hindi":"फिटनेस","detected_language":"hindi","edit_plan":{"color_grade":"warm","brightness":5,"contrast":10,"saturation":15,"sharpen":true,"quality_enhance":true,"denoise":true,"platform":"reels"},"edit_summary":"English summary","edit_summary_hindi":"Hindi summary"}"""
-    
+def ffmpeg_ok():
+    ok, out = run_cmd(["ffmpeg","-version"], timeout=10)
+    return ok
+
+def get_video_info(path):
+    try:
+        cmd = ["ffprobe","-v","quiet","-print_format","json","-show_format",str(path)]
+        r = subprocess.run(["nice","-n","19"]+cmd, capture_output=True, text=True, timeout=30)
+        d = json.loads(r.stdout)
+        return {"duration": float(d.get("format",{}).get("duration",0))}
+    except Exception as e:
+        print(f"ffprobe error: {e}")
+        return None
+
+def analyze_with_groq(command_text, ref_url=""):
+    fallback = {"niche":"general","niche_hindi":"सामान्य","detected_language":"english","edit_plan":{"color_grade":"vibrant","brightness":5,"contrast":10,"saturation":15,"sharpen":True,"quality_enhance":True,"denoise":True,"platform":"reels"},"edit_summary":"Standard enhancement.","edit_summary_hindi":"मानक सुधार।"}
+    if not groq_client:
+        return fallback
+    system_prompt = "You are an expert video editor AI. Respond ONLY with valid JSON.\nFormat: {\"niche\":\"fitness\",\"niche_hindi\":\"फिटनेस\",\"detected_language\":\"hindi\",\"edit_plan\":{\"color_grade\":\"warm\",\"brightness\":5,\"contrast\":10,\"saturation\":15,\"sharpen\":true,\"quality_enhance\":true,\"denoise\":true,\"platform\":\"reels\"},\"edit_summary\":\"English summary\",\"edit_summary_hindi\":\"Hindi summary\"}"
     msg = f"Creator: {command_text}"
     if ref_url:
         msg += f"\nReference: {ref_url}"
-    
     try:
         resp = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
@@ -59,22 +75,17 @@ Format:
         return json.loads(raw)
     except Exception as e:
         print(f"Groq error: {e}")
-        return {"niche":"general","niche_hindi":"सामान्य","detected_language":"english",
-                "edit_plan":{"color_grade":"vibrant","brightness":5,"contrast":10,"saturation":15,
-                             "sharpen":True,"quality_enhance":True,"denoise":True,"platform":"reels"},
-                "edit_summary":"Standard enhancement applied.","edit_summary_hindi":"मानक सुधार लागू।"}
+        return fallback
 
-def build_filters(plan):
+def build_filters(plan, w=1280, h=720):
     ep = plan.get("edit_plan", {})
     f = []
     if ep.get("denoise"): f.append("hqdn3d=1.5:1.5:6:6")
     if ep.get("sharpen"): f.append("unsharp=5:5:0.8:5:5:0.4")
-    
     b = ep.get("brightness", 0) / 100.0
     c = 1.0 + ep.get("contrast", 0) / 100.0
     s = 1.0 + ep.get("saturation", 0) / 100.0
     g = ep.get("color_grade","natural")
-    
     presets = {
         "warm": f"colorbalance=rs=0.1:gs=-0.05:bs=-0.1,eq=brightness={b}:contrast={c}:saturation={s}",
         "cool": f"colorbalance=rs=-0.08:bs=0.1,eq=brightness={b}:contrast={c}:saturation={s}",
@@ -84,57 +95,55 @@ def build_filters(plan):
         "natural": f"eq=brightness={b}:contrast={c}:saturation={s}",
     }
     f.append(presets.get(g, presets["natural"]))
-    f.append("scale=1920:1080:force_original_aspect_ratio=decrease:flags=lanczos")
-    f.append("pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black")
+    f.append(f"scale={w}:{h}:force_original_aspect_ratio=decrease:flags=bilinear")
+    f.append(f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black")
     return ",".join(f)
 
 def apply_edits(inp, out, plan, job_id):
     try:
-        # STEP 1: Optimize Input
-        jobs[job_id].update({"progress": 10, "status_text": "Step 1/2: Optimizing video size..."})
-        temp_file = TEMP_FOLDER / f"opt_{job_id}.mp4"
-        
-        pre_cmd = [
-            "ffmpeg", "-y", "-i", str(inp),
-            "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease",
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-            "-c:a", "aac", "-b:a", "128k",
-            str(temp_file)
-        ]
-        
-        ok, err = run_cmd(pre_cmd, timeout=300)
+        jobs[job_id].update({"progress":20,"status_text":"Applying AI edits..."})
+        vf = build_filters(plan, 1280, 720)
+        cmd = ["ffmpeg","-y","-i",str(inp),"-vf",vf,
+               "-c:v","libx264","-preset","ultrafast","-crf","24",
+               "-threads","1","-max_muxing_queue_size","1024",
+               "-c:a","aac","-b:a","96k","-ac","2",
+               "-movflags","+faststart",str(out)]
+        jobs[job_id].update({"progress":55,"status_text":"Encoding video..."})
+        ok, err = ff(cmd, timeout=600)
         if not ok:
-            jobs[job_id].update({"status": "error", "error": f"Optimization failed: {err}"})
-            return
-        
-        # STEP 2: Apply AI Filters
-        jobs[job_id].update({"progress": 50, "status_text": "Step 2/2: Applying AI effects..."})
-        vf = build_filters(plan)
-        
-        final_cmd = [
-            "ffmpeg", "-y", "-i", str(temp_file),
-            "-vf", vf,
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-c:a", "copy",
-            "-movflags", "+faststart", str(out)
-        ]
-        
-        ok, err = run_cmd(final_cmd, timeout=300)
-        
-        if temp_file.exists():
-            try:
-                temp_file.unlink()
-            except:
-                pass
-                
-        if not ok:
-            jobs[job_id].update({"status": "error", "error": f"Editing failed: {err}"})
-            return
-            
-        jobs[job_id].update({"status": "done", "progress": 100, "status_text": "Ready!", "output_file": str(out)})
-        
+            jobs[job_id].update({"status":"error","error":"FFmpeg failed: "+err[:300]}); return
+        jobs[job_id].update({"status":"done","progress":100,"status_text":"Ready!","output_file":str(out)})
     except Exception as e:
-        jobs[job_id].update({"status": "error", "error": str(e)})
+        jobs[job_id].update({"status":"error","error":str(e)})
+
+def apply_edits_two_step(inp, out, plan, job_id):
+    temp_file = TEMP_FOLDER / f"temp_{job_id}.mp4"
+    try:
+        jobs[job_id].update({"progress":8,"status_text":"Step 1/2: Optimizing..."})
+        pre_cmd = ["ffmpeg","-y","-i",str(inp),
+                   "-vf","scale=1280:720:force_original_aspect_ratio=decrease",
+                   "-c:v","libx264","-preset","ultrafast","-crf","26",
+                   "-threads","1","-max_muxing_queue_size","1024",
+                   "-c:a","aac","-b:a","96k","-ac","2",str(temp_file)]
+        ok, err = ff(pre_cmd, timeout=600)
+        if not ok:
+            jobs[job_id].update({"status":"error","error":"Step 1 failed: "+err[:200]}); return
+        jobs[job_id].update({"progress":50,"status_text":"Step 2/2: Applying AI effects..."})
+        vf = build_filters(plan, 1280, 720)
+        final_cmd = ["ffmpeg","-y","-i",str(temp_file),"-vf",vf,
+                     "-c:v","libx264","-preset","ultrafast","-crf","24",
+                     "-threads","1","-max_muxing_queue_size","1024",
+                     "-c:a","copy","-movflags","+faststart",str(out)]
+        ok, err = ff(final_cmd, timeout=600)
+        if not ok:
+            jobs[job_id].update({"status":"error","error":"Step 2 failed: "+err[:200]}); return
+        jobs[job_id].update({"status":"done","progress":100,"status_text":"Ready!","output_file":str(out)})
+    except Exception as e:
+        jobs[job_id].update({"status":"error","error":str(e)})
+    finally:
+        if temp_file.exists():
+            try: temp_file.unlink()
+            except: pass
 
 @app.route("/")
 def index():
@@ -143,6 +152,21 @@ def index():
 @app.route("/health")
 def health():
     return "OK", 200
+
+@app.route("/api/debug")
+def debug():
+    return jsonify({
+        "version": APP_VERSION,
+        "uptime_seconds": int(time.time() - START_TIME),
+        "ffmpeg_installed": ffmpeg_ok(),
+        "active_jobs": len(jobs),
+        "job_ids": list(jobs.keys()),
+        "tmp_dirs": {
+            "uploads": len(list(UPLOAD_FOLDER.glob("*"))),
+            "outputs": len(list(OUTPUT_FOLDER.glob("*"))),
+            "temp": len(list(TEMP_FOLDER.glob("*")))
+        }
+    })
 
 @app.route("/api/analyze", methods=["POST"])
 def analyze():
@@ -167,25 +191,33 @@ def edit():
     fid, plan = data.get("file_id"), data.get("plan")
     if not fid or not plan: return jsonify({"error":"Missing data"}), 400
     inp = UPLOAD_FOLDER / fid
-    if not inp.exists(): return jsonify({"error":"File not found"}), 404
-    
+    if not inp.exists(): return jsonify({"error":"File not found - please upload again"}), 404
+
+    file_size_mb = inp.stat().st_size / (1024 * 1024)
+    info = get_video_info(inp)
+    duration = info["duration"] if info else 0
+
+    if file_size_mb > 80:
+        return jsonify({"error":f"Video is {file_size_mb:.0f}MB - too large for free plan."}), 400
+    if duration > 120:
+        return jsonify({"error":f"Video is {int(duration)}s - too long. Trim to under 2 min."}), 400
+
     jid = uuid.uuid4().hex
     out = OUTPUT_FOLDER / f"edited_{jid}.mp4"
     jobs[jid] = {"status":"processing","progress":0,"status_text":"Starting...","output_file":None,"error":None}
-    
-    threading.Thread(target=apply_edits, args=(inp,out,plan,jid), daemon=True).start()
+
+    if file_size_mb > 25:
+        threading.Thread(target=apply_edits_two_step, args=(inp, out, plan, jid), daemon=True).start()
+    else:
+        threading.Thread(target=apply_edits, args=(inp, out, plan, jid), daemon=True).start()
     return jsonify({"job_id": jid})
 
 @app.route("/api/status/<jid>")
 def status(jid):
     j = jobs.get(jid)
-    if not j:
-        return jsonify({
-            "error": "Session lost. Server may have restarted. Please refresh and try again.",
-            "status": "lost",
-            "progress": 0
-        }), 404
-    return jsonify(j)
+    if j:
+        return jsonify(j)
+    return jsonify({"status":"expired","progress":0,"status_text":"Job lost (server restarted).","error":"Job not found - server may have restarted"}), 404
 
 @app.route("/api/download/<jid>")
 def download(jid):
@@ -200,7 +232,7 @@ def preview(jid):
     return send_file(j["output_file"], mimetype="video/mp4")
 
 HTML = """<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>AI Video Editor</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -244,68 +276,47 @@ video{width:100%;border-radius:9px;background:#000;margin-bottom:.65rem}
 @keyframes p{0%,100%{opacity:1}50%{opacity:.5}}
 .row{display:flex;gap:.45rem;align-items:center;margin-bottom:.45rem}
 .ph{text-align:center;padding:2.5rem 1rem}
+.foot{text-align:center;color:#444;font-size:.7rem;padding:1rem}
 </style></head><body>
 <header><div class="wrap" style="display:flex;align-items:center;gap:1rem;width:100%">
-  <div class="logo">🎬</div>
-  <div><h1>AI Video Editor</h1><div style="font-size:.75rem;color:var(--muted)">Groq AI · Hindi & English</div></div>
+<div class="logo">&#127916;</div>
+<div><h1>AI Video Editor</h1><div style="font-size:.75rem;color:var(--muted)">Groq AI - Hindi & English</div></div>
 </div></header>
 <div class="main"><div class="wrap"><div class="grid">
 <div style="display:flex;flex-direction:column;gap:1.1rem">
-  <div class="card">
-    <div class="sh"><div class="sn">1</div><h2>Upload your raw video</h2></div>
-    <div class="uzone" id="zone" onclick="document.getElementById('fi').click()">
-      <div class="ico">📹</div><div>Click or drag & drop</div>
-      <div class="hint">MP4 MOV AVI MKV · Max 500MB (Try <30MB first)</div>
-    </div>
-    <input type="file" id="fi" accept="video/*" style="display:none" onchange="doUpload(this)"/>
-  </div>
-  <div class="card">
-    <div class="sh"><div class="sn">2</div><h2>Reference link (optional)</h2></div>
-    <input type="url" id="ref" placeholder="YouTube / Instagram / TikTok URL..."/>
-    <div class="hint" style="margin-top:.35rem">AI copies the editing style</div>
-  </div>
-  <div class="card hl">
-    <div class="sh"><div class="sn">3</div><h2>Tell AI what you want</h2></div>
-    <textarea id="cmd" placeholder="Hindi ya English mein likho:&#10;&#10;Main fitness creator hoon, trending reels banao&#10;&#10;OR: I'm a vlogger, make cinematic YouTube video"></textarea>
-    <div class="row">
-      <button class="vbtn" id="vb" onclick="toggleVoice()">🎤</button>
-      <span style="font-size:.78rem;color:var(--muted)" id="vs">Tap mic to speak</span>
-    </div>
-    <button class="btn bp" id="ab" onclick="doAnalyze()">🤖 Analyze with AI</button>
-  </div>
-</div>
+<div class="card"><div class="sh"><div class="sn">1</div><h2>Upload your raw video</h2></div>
+<div class="uzone" id="zone" onclick="document.getElementById('fi').click()">
+<div class="ico">&#128249;</div><div>Click or drag & drop</div>
+<div class="hint">MP4 MOV AVI MKV - Max 80MB, under 2 min</div></div>
+<input type="file" id="fi" accept="video/*" style="display:none" onchange="doUpload(this)"/></div>
+<div class="card"><div class="sh"><div class="sn">2</div><h2>Reference link (optional)</h2></div>
+<input type="url" id="ref" placeholder="YouTube / Instagram / TikTok URL..."/>
+<div class="hint" style="margin-top:.35rem">AI copies the editing style</div></div>
+<div class="card hl"><div class="sh"><div class="sn">3</div><h2>Tell AI what you want</h2></div>
+<textarea id="cmd" placeholder="Hindi ya English mein likho: Main fitness creator hoon, trending reels banao OR: I am a vlogger, make cinematic YouTube video"></textarea>
+<div class="row"><button class="vbtn" id="vb" onclick="toggleVoice()">&#127908;</button>
+<span style="font-size:.78rem;color:var(--muted)" id="vs">Tap mic to speak</span></div>
+<button class="btn bp" id="ab" onclick="doAnalyze()">&#129302; Analyze with AI</button></div></div>
 <div style="display:flex;flex-direction:column;gap:1.1rem">
-  <div class="card" id="pc" style="display:none">
-    <h2 style="margin-bottom:.7rem">🧠 AI Edit Plan</h2>
-    <div id="nd"></div><div id="sd"></div>
-    <div class="pgrid" id="pg"></div>
-    <div style="margin-top:.9rem">
-      <button class="btn bp" id="eb" onclick="doEdit()" disabled>⚡ Start Editing</button>
-      <div class="hint" style="text-align:center;margin-top:.35rem" id="eh">Upload a video first</div>
-    </div>
-  </div>
-  <div class="card" id="prg" style="display:none">
-    <h2 style="margin-bottom:.7rem">⚙️ Editing...</h2>
-    <div class="pbar"><div class="pfill" id="pf" style="width:0%"></div></div>
-    <div style="display:flex;justify-content:space-between;font-size:.78rem;color:var(--muted)">
-      <span id="pt">Starting...</span><span id="pp">0%</span>
-    </div>
-    <div class="hint" style="margin-top:.4rem">2–5 min for long videos</div>
-  </div>
-  <div class="card" id="rc" style="display:none">
-    <h2 style="margin-bottom:.7rem">✅ Ready!</h2>
-    <video id="pv" controls playsinline></video>
-    <a id="dl" class="btn bg">⬇️ Download Edited Video</a>
-    <button class="btn bo" onclick="resetAll()">🔄 Edit another</button>
-  </div>
-  <div id="eb2" class="err"></div>
-  <div class="card ph" id="ph">
-    <div style="font-size:2.8rem;opacity:.18;margin-bottom:.65rem">🎬</div>
-    <div style="color:var(--muted);font-size:.88rem">Upload · Reference · Describe · Edit!</div>
-    <div style="margin-top:.9rem;font-size:.76rem;color:#444">Fitness · Vlog · Entertainment · Gaming · Food · Travel</div>
-  </div>
-</div>
-</div></div></div>
+<div class="card" id="pc" style="display:none"><h2 style="margin-bottom:.7rem">&#129504; AI Edit Plan</h2>
+<div id="nd"></div><div id="sd"></div><div class="pgrid" id="pg"></div>
+<div style="margin-top:.9rem"><button class="btn bp" id="eb" onclick="doEdit()" disabled>&#9889; Start Editing</button>
+<div class="hint" style="text-align:center;margin-top:.35rem" id="eh">Upload a video first</div></div></div>
+<div class="card" id="prg" style="display:none"><h2 style="margin-bottom:.7rem">&#9881; Editing...</h2>
+<div class="pbar"><div class="pfill" id="pf" style="width:0%"></div></div>
+<div style="display:flex;justify-content:space-between;font-size:.78rem;color:var(--muted)">
+<span id="pt">Starting...</span><span id="pp">0%</span></div>
+<div class="hint" style="margin-top:.4rem">1-3 min for most videos</div></div>
+<div class="card" id="rc" style="display:none"><h2 style="margin-bottom:.7rem">&#9989; Ready!</h2>
+<video id="pv" controls playsinline></video>
+<a id="dl" class="btn bg">&#11015; Download Edited Video</a>
+<button class="btn bo" onclick="resetAll()">&#128260; Edit another</button></div>
+<div id="eb2" class="err"></div>
+<div class="card ph" id="ph"><div style="font-size:2.8rem;opacity:.18;margin-bottom:.65rem">&#127916;</div>
+<div style="color:var(--muted);font-size:.88rem">Upload - Reference - Describe - Edit!</div>
+<div style="margin-top:.9rem;font-size:.76rem;color:#444">Fitness - Vlog - Entertainment - Gaming - Food - Travel</div></div>
+</div></div></div></div>
+<div class="foot">v3.0-lowcpu - <a href="/api/debug" target="_blank" style="color:#666">system check</a></div>
 <script>
 let fid=null,plan=null,jid=null,poll=null,rec=null,isRec=false;
 const zone=document.getElementById('zone');
@@ -314,107 +325,63 @@ zone.addEventListener('dragleave',()=>zone.style.borderColor='');
 zone.addEventListener('drop',e=>{e.preventDefault();zone.style.borderColor='';const f=e.dataTransfer.files[0];if(f)doUploadFile(f)});
 function doUpload(inp){if(inp.files[0])doUploadFile(inp.files[0]);}
 async function doUploadFile(file){
-  zone.innerHTML='<div class="ico">⏳</div><div>Uploading '+file.name+'...</div>';
-  const fd=new FormData();fd.append('video',file);
-  try{
-    const r=await fetch('/api/upload',{method:'POST',body:fd});
-    const d=await r.json();
-    if(d.error)throw new Error(d.error);
-    fid=d.file_id;
-    zone.innerHTML='<div class="ico">✅</div><div style="color:var(--green)">'+file.name+'</div><div class="hint">Uploaded!</div>';
-    updBtn();
-  }catch(e){zone.innerHTML='<div class="ico">❌</div><div style="color:var(--red)">'+e.message+'</div>';}
-}
+if(file.size>80*1024*1024){zone.innerHTML='<div class="ico">&#10060;</div><div style="color:var(--red)">File too large! Max 80MB.</div>';return;}
+zone.innerHTML='<div class="ico">&#9203;</div><div>Uploading '+file.name+'...</div>';
+const fd=new FormData();fd.append('video',file);
+try{const r=await fetch('/api/upload',{method:'POST',body:fd});const d=await r.json();
+if(d.error)throw new Error(d.error);fid=d.file_id;
+zone.innerHTML='<div class="ico">&#9989;</div><div style="color:var(--green)">'+file.name+'</div><div class="hint">Uploaded!</div>';updBtn();}
+catch(e){zone.innerHTML='<div class="ico">&#10060;</div><div style="color:var(--red)">'+e.message+'</div>';}}
 function toggleVoice(){
-  if(!('webkitSpeechRecognition'in window)&&!('SpeechRecognition'in window)){alert('Use Chrome!');return;}
-  if(isRec){rec&&rec.stop();return;}
-  const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
-  rec=new SR();rec.lang='hi-IN';rec.interimResults=true;
-  rec.onstart=()=>{isRec=true;document.getElementById('vb').classList.add('on');document.getElementById('vs').textContent='🔴 Recording...';};
-  rec.onresult=e=>{let t='';for(let i=e.resultIndex;i<e.results.length;i++)t+=e.results[i][0].transcript;document.getElementById('cmd').value=t;};
-  rec.onend=rec.onerror=()=>{isRec=false;document.getElementById('vb').classList.remove('on');document.getElementById('vs').textContent='✅ Done!';setTimeout(()=>document.getElementById('vs').textContent='Tap mic to speak',2000);};
-  rec.start();
-}
+if(!('webkitSpeechRecognition'in window)&&!('SpeechRecognition'in window)){alert('Use Chrome!');return;}
+if(isRec){rec&&rec.stop();return;}
+const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+rec=new SR();rec.lang='hi-IN';rec.interimResults=true;
+rec.onstart=()=>{isRec=true;document.getElementById('vb').classList.add('on');document.getElementById('vs').textContent='Recording...';};
+rec.onresult=e=>{let t='';for(let i=e.resultIndex;i<e.results.length;i++)t+=e.results[i][0].transcript;document.getElementById('cmd').value=t;};
+rec.onend=rec.onerror=()=>{isRec=false;document.getElementById('vb').classList.remove('on');document.getElementById('vs').textContent='Done!';setTimeout(()=>document.getElementById('vs').textContent='Tap mic to speak',2000);};
+rec.start();}
 async function doAnalyze(){
-  const cmd=document.getElementById('cmd').value.trim();
-  if(!cmd){alert('Please describe your niche!');return;}
-  const btn=document.getElementById('ab');
-  btn.disabled=true;btn.textContent='🤖 Analyzing...';
-  document.getElementById('ph').style.display='none';
-  document.getElementById('pc').style.display='none';
-  try{
-    const r=await fetch('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({command:cmd,ref_url:document.getElementById('ref').value.trim()})});
-    plan=await r.json();showPlan(plan);
-  }catch(e){showErr('AI error: '+e.message);}
-  finally{btn.disabled=false;btn.textContent='🤖 Analyze with AI';}
-}
+const cmd=document.getElementById('cmd').value.trim();
+if(!cmd){alert('Please describe your niche!');return;}
+const btn=document.getElementById('ab');btn.disabled=true;btn.textContent='Analyzing...';
+document.getElementById('ph').style.display='none';document.getElementById('pc').style.display='none';
+try{const r=await fetch('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:cmd,ref_url:document.getElementById('ref').value.trim()})});
+plan=await r.json();showPlan(plan);}
+catch(e){showErr('AI error: '+e.message);}
+finally{btn.disabled=false;btn.textContent='Analyze with AI';}}
 function showPlan(p){
-  if(p.error){showErr(p.error);return;}
-  const ep=p.edit_plan||{};
-  document.getElementById('nd').innerHTML='<div class="chip">🎯 '+p.niche+(p.niche_hindi?' · '+p.niche_hindi:'')+'</div>';
-  const lang=p.detected_language||'english';
-  const s=(lang==='hindi'||lang==='hinglish')?(p.edit_summary_hindi||p.edit_summary):p.edit_summary;
-  document.getElementById('sd').innerHTML='<div class="summ">'+s+'</div>';
-  const it=[['Color',ep.color_grade],['Platform',ep.platform],['Quality','✅'],['Denoise',ep.denoise?'✅':'—']];
-  document.getElementById('pg').innerHTML=it.map(([k,v])=>'<div class="pi"><div class="pl">'+k+'</div><div class="pv">'+v+'</div></div>').join('');
-  document.getElementById('pc').style.display='block';updBtn();
-}
-function updBtn(){
-  const ok=fid&&plan;
-  document.getElementById('eb').disabled=!ok;
-  document.getElementById('eh').textContent=ok?'Ready!':(fid?'Analyze first':'Upload video first');
-}
+const ep=p.edit_plan||{};
+document.getElementById('nd').innerHTML='<div class="chip">&#127919; '+p.niche+(p.niche_hindi?' - '+p.niche_hindi:'')+'</div>';
+const lang=p.detected_language||'english';
+const s=(lang==='hindi'||lang==='hinglish')?(p.edit_summary_hindi||p.edit_summary):p.edit_summary;
+document.getElementById('sd').innerHTML='<div class="summ">'+s+'</div>';
+const it=[['Color',ep.color_grade],['Platform',ep.platform],['Quality','720p'],['Denoise',ep.denoise?'&#9989;':'&#8212;']];
+document.getElementById('pg').innerHTML=it.map(([k,v])=>'<div class="pi"><div class="pl">'+k+'</div><div class="pv">'+v+'</div></div>').join('');
+document.getElementById('pc').style.display='block';updBtn();}
+function updBtn(){const ok=fid&&plan;document.getElementById('eb').disabled=!ok;document.getElementById('eh').textContent=ok?'Ready!':(fid?'Analyze first':'Upload video first');}
 async function doEdit(){
-  if(!fid||!plan)return;
-  document.getElementById('pc').style.display='none';
-  document.getElementById('prg').style.display='block';
-  document.getElementById('rc').style.display='none';
-  try{
-    const r=await fetch('/api/edit',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({file_id:fid,plan})});
-    const d=await r.json();
-    if(d.error)throw new Error(d.error);
-    jid=d.job_id;doPoll();
-  }catch(e){showErr(e.message);document.getElementById('prg').style.display='none';}
-}
+if(!fid||!plan)return;
+document.getElementById('pc').style.display='none';document.getElementById('prg').style.display='block';document.getElementById('rc').style.display='none';
+try{const r=await fetch('/api/edit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({file_id:fid,plan})});
+const d=await r.json();if(d.error)throw new Error(d.error);jid=d.job_id;doPoll();}
+catch(e){showErr(e.message);document.getElementById('prg').style.display='none';document.getElementById('pc').style.display='block';}}
 function doPoll(){
-  if(poll)clearInterval(poll);
-  poll=setInterval(async()=>{
-    try{
-      const r=await fetch('/api/status/'+jid);
-      const d=await r.json();
-      
-      if(d.status === 'lost' || (r.status === 404 && d.error)) {
-        clearInterval(poll);
-        showErr("⚠️ Server restarted. Your job was lost. Please refresh and try a smaller video (<30MB).");
-        document.getElementById('prg').style.display='none';
-        document.getElementById('pc').style.display='block';
-        return;
-      }
-
-      document.getElementById('pf').style.width=(d.progress||0)+'%';
-      document.getElementById('pp').textContent=(d.progress||0)+'%';
-      document.getElementById('pt').textContent=d.status_text||'Processing...';
-      if(d.status==='done'){clearInterval(poll);showResult();}
-      else if(d.status==='error'){clearInterval(poll);showErr(d.error||'Error');document.getElementById('prg').style.display='none';}
-    }catch(e){}
-  },1500);
-}
-function showResult(){
-  document.getElementById('prg').style.display='none';
-  document.getElementById('rc').style.display='block';
-  document.getElementById('pv').src='/api/preview/'+jid;
-  document.getElementById('dl').href='/api/download/'+jid;
-}
-function showErr(msg){const b=document.getElementById('eb2');b.textContent='❌ '+msg;b.style.display='block';setTimeout(()=>b.style.display='none',8000);}
-function resetAll(){
-  fid=null;plan=null;jid=null;if(poll)clearInterval(poll);
-  zone.innerHTML='<div class="ico">📹</div><div>Click or drag & drop</div><div class="hint">MP4 MOV AVI MKV · Max 500MB</div>';
-  document.getElementById('cmd').value='';document.getElementById('ref').value='';
-  ['pc','prg','rc'].forEach(id=>document.getElementById(id).style.display='none');
-  document.getElementById('ph').style.display='block';
-}
+if(poll)clearInterval(poll);
+poll=setInterval(async()=>{
+try{const r=await fetch('/api/status/'+jid);const d=await r.json();
+if(!d||d.error){clearInterval(poll);showErr(d.error||'Processing failed. Try again.');document.getElementById('prg').style.display='none';return;}
+document.getElementById('pf').style.width=(d.progress||0)+'%';document.getElementById('pp').textContent=(d.progress||0)+'%';document.getElementById('pt').textContent=d.status_text||'Processing...';
+if(d.status==='done'){clearInterval(poll);showResult();}
+else if(d.status==='error'||d.status==='expired'){clearInterval(poll);showErr(d.error||'Error');document.getElementById('prg').style.display='none';}}
+catch(e){}},1500);}
+function showResult(){document.getElementById('prg').style.display='none';document.getElementById('rc').style.display='block';document.getElementById('pv').src='/api/preview/'+jid;document.getElementById('dl').href='/api/download/'+jid;}
+function showErr(msg){const b=document.getElementById('eb2');b.textContent='Error: '+msg;b.style.display='block';setTimeout(()=>b.style.display='none',9000);}
+function resetAll(){fid=null;plan=null;jid=null;if(poll)clearInterval(poll);
+zone.innerHTML='<div class="ico">&#128249;</div><div>Click or drag & drop</div><div class="hint">MP4 MOV AVI MKV - Max 80MB, under 2 min</div>';
+document.getElementById('cmd').value='';document.getElementById('ref').value='';
+['pc','prg','rc'].forEach(id=>document.getElementById(id).style.display='none');
+document.getElementById('ph').style.display='block';}
 </script></body></html>"""
 
 if __name__ == "__main__":
