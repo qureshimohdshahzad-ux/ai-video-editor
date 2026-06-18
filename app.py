@@ -16,6 +16,13 @@ from groq import Groq
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "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")
 UPLOAD_FOLDER = Path("/tmp/uploads")
 OUTPUT_FOLDER = Path("/tmp/outputs")
+UPLOAD_FOLDER = Path("/tmp/uploads")
+OUTPUT_FOLDER = Path("/tmp/outputs")
+TEMP_FOLDER = Path("/tmp/temp_processing") # <-- NEW ASSISTANCE FOLDER
+
+UPLOAD_FOLDER.mkdir(exist_ok=True)
+OUTPUT_FOLDER.mkdir(exist_ok=True)
+TEMP_FOLDER.mkdir(exist_ok=True) # <-- CREATE IT
 ALLOWED_EXTENSIONS = {"mp4", "mov", "avi", "mkv", "webm"}
  
 UPLOAD_FOLDER.mkdir(exist_ok=True)
