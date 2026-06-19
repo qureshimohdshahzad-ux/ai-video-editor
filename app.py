@@ -1,10 +1,10 @@
-import os, re, json, uuid, time, threading, subprocess
+import os, re, json, uuid, time, threading, subprocess, traceback
 from pathlib import Path
 from flask import Flask, request, jsonify, send_file, render_template_string
 from werkzeug.utils import secure_filename
 from groq import Groq
 
-APP_VERSION = "4.4-fast"
+APP_VERSION = "4.5-stable"
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "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")
 
@@ -26,18 +26,19 @@ def run_cmd(cmd, timeout=600):
     try:
         r = subprocess.run(["nice", "-n", "19"] + cmd, capture_output=True, text=True, timeout=timeout)
         return r.returncode == 0, r.stderr
+    except subprocess.TimeoutExpired:
+        return False, "Timeout"
     except Exception as e:
         return False, str(e)
 
 def analyze_with_groq(command_text, ref_url=""):
-    system_prompt = """You are a professional trending reel editor. Always follow user's request.
-Respond ONLY with this exact JSON format:
+    system_prompt = """You are a professional trending reel editor. Respond ONLY with this exact JSON format:
 {
   "color_grade": "cinematic_warm",
   "transition_style": "fast_zoom",
   "caption_style": "bold_white_black_outline",
   "speed_ramp": "smooth_fast",
-  "edit_summary": "One short sentence"
+  "edit_summary": "Short description"
 }"""
     msg = f"User request: {command_text}"
     if ref_url: msg += f"\nReference: {ref_url}"
@@ -50,45 +51,39 @@ Respond ONLY with this exact JSON format:
         raw = re.sub(r"```json|```", "", resp.choices[0].message.content.strip())
         return json.loads(raw)
     except:
-        return {"color_grade":"cinematic_warm","transition_style":"fast_zoom","caption_style":"bold_white_black_outline","speed_ramp":"smooth_fast","edit_summary":"Trending intro reel"}
+        return {"color_grade":"cinematic_warm","transition_style":"fast_zoom","caption_style":"bold_white_black_outline","speed_ramp":"smooth_fast","edit_summary":"Trending reel"}
 
-def build_fast_filters():
-    # Fast but good looking cinematic warm + zoom effect
-    return "colorbalance=rs=0.15:gs=-0.05:bs=-0.1,eq=brightness=0.04:contrast=1.15:saturation=1.25,zoompan=z='if(lte(zoom,1.0),1.25,zoom-0.005)':x='iw/2-(iw/zoom)/2':y='ih/2-(ih/zoom)/2':d=70:s=854x480,hqdn3d=2:2:5:5,scale=854:480:force_original_aspect_ratio=decrease,pad=854:480:(ow-iw)/2:(oh-ih)/2:black"
+def build_filters():
+    return "colorbalance=rs=0.15:gs=-0.05:bs=-0.12,eq=brightness=0.05:contrast=1.18:saturation=1.25,zoompan=z='if(lte(zoom,1.0),1.25,zoom-0.004)':x='iw/2-(iw/zoom)/2':y='ih/2-(ih/zoom)/2':d=80:s=854x480,hqdn3d=1:1:4:4,scale=854:480:force_original_aspect_ratio=decrease,pad=854:480:(ow-iw)/2:(oh-ih)/2:black"
 
 def apply_pro_edits(inp, out, plan, job_id):
     try:
-        jobs[job_id].update({"progress":10, "status_text":"Starting Fast Edit..."})
-        time.sleep(1)
+        jobs[job_id].update({"progress":20, "status_text":"Applying cinematic warm grade + zoom..."})
         
-        jobs[job_id].update({"progress":35, "status_text":"Applying Warm Cinematic Grade + Zoom Transitions..."})
-        
-        vf = build_fast_filters()
+        vf = build_filters()
         cmd = [
             "ffmpeg", "-y", "-i", str(inp),
             "-vf", vf,
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k",
-            "-movflags", "+faststart", str(out)
+            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(out)
         ]
         
         ok, err = run_cmd(cmd, timeout=480)
         
         if ok:
-            jobs[job_id].update({"progress":75, "status_text":"Adding Bold Captions..."})
-            # Add captions in second fast pass
+            jobs[job_id].update({"progress":70, "status_text":"Adding bold captions..."})
             caption_cmd = [
                 "ffmpeg", "-y", "-i", str(out),
-                "-vf", r"drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:fontsize=32:fontcolor=white:bordercolor=black:borderw=6:x=(w-text_w)/2:y=h-85:text='%{pts\:gmtime\:0\:%M:%S}'",
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
-                "-c:a", "copy", "-movflags", "+faststart", str(out)
+                "-vf", r"drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:fontsize=32:fontcolor=white:bordercolor=black:borderw=6:x=(w-text_w)/2:y=h-90:text='%{pts\:gmtime\:0\:%M:%S}'",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24", "-c:a", "copy", str(out)
             ]
             run_cmd(caption_cmd, timeout=300)
             jobs[job_id].update({"status":"done","progress":100,"status_text":"Ready!","output_file":str(out)})
         else:
-            jobs[job_id].update({"status":"error","error":err})
+            jobs[job_id].update({"status":"error","error":err or "FFmpeg failed"})
     except Exception as e:
         jobs[job_id].update({"status":"error","error":str(e)})
+        print("Error in apply_pro_edits:", traceback.format_exc())
 
 # ====================== ROUTES ======================
 @app.route("/")
@@ -113,23 +108,28 @@ def edit():
     fid = data.get("file_id")
     plan = data.get("plan")
     inp = UPLOAD_FOLDER / fid
-    if not inp.exists(): return jsonify({"error":"File not found"}), 404
+    if not inp.exists():
+        return jsonify({"error":"File not found"}), 404
     
     jid = uuid.uuid4().hex
     out = OUTPUT_FOLDER / f"edited_{jid}.mp4"
-    jobs[jid] = {"status":"processing","progress":0,"status_text":"Starting Fast Edit...","output_file":None,"error":None}
+    jobs[jid] = {"status":"processing","progress":0,"status_text":"Starting Edit...","output_file":None,"error":None}
     
     threading.Thread(target=apply_pro_edits, args=(inp, out, plan, jid), daemon=True).start()
     return jsonify({"job_id": jid})
 
 @app.route("/api/status/<jid>")
 def status(jid):
-    return jsonify(jobs.get(jid, {"status":"expired","progress":0,"status_text":"Job expired. Please try again."}))
+    job = jobs.get(jid)
+    if job:
+        return jsonify(job)
+    return jsonify({"status":"expired","progress":0,"status_text":"Job expired. Please try again."})
 
 @app.route("/api/download/<jid>")
 def download(jid):
     j = jobs.get(jid)
-    if not j or j.get("status") != "done": return jsonify({"error":"Not ready"}), 400
+    if not j or j.get("status") != "done":
+        return jsonify({"error":"Not ready"}), 400
     return send_file(j["output_file"], as_attachment=True, download_name="Trending_Reel.mp4")
 
 HTML = """<!DOCTYPE html>
@@ -146,7 +146,7 @@ header{background:#1a1a2e;padding:15px;border-radius:12px;display:flex;align-ite
 #status{display:none}
 </style></head><body>
 <div class="wrap">
-<header><div style="font-size:2.5rem">🎬</div><h1>AI Video Editor Pro v4.4 (Fast)</h1></header>
+<header><div style="font-size:2.5rem">🎬</div><h1>AI Video Editor Pro v4.5</h1></header>
 
 <div class="card">
   <h2>1. Upload Video</h2>
@@ -160,13 +160,13 @@ header{background:#1a1a2e;padding:15px;border-radius:12px;display:flex;align-ite
 
 <div class="card">
   <h2>3. Describe Style</h2>
-  <textarea id="cmd" rows="4" placeholder="Make a trending intro reel with fast zoom transitions, energy, bold white captions with black outline, smooth speed ramps, and cinematic warm color grade"></textarea>
+  <textarea id="cmd" rows="4" placeholder="Make a trending intro reel with fast zoom transitions, energy, bold white captions with black outline..."></textarea>
 </div>
 
 <button class="btn" onclick="doAnalyze()">🤖 Generate Pro Edit Plan</button>
 
 <div id="plan_area" class="card" style="display:none"></div>
-<button id="edit_btn" class="btn green" style="display:none" onclick="startEdit()">⚡ Start Fast Editing</button>
+<button id="edit_btn" class="btn green" style="display:none" onclick="startEdit()">⚡ Start Pro Editing</button>
 
 <div id="status" class="card">
   <h3 id="status_text">Processing...</h3>
@@ -205,7 +205,7 @@ async function doAnalyze(){
 }
 
 async function startEdit(){
-  if(!fid || !plan) return;
+  if(!fid || !plan) return alert("Please upload video and generate plan first");
   document.getElementById('status').style.display = 'block';
   const r = await fetch('/api/edit',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({file_id:fid, plan:plan})});
@@ -227,6 +227,9 @@ function pollStatus(){
       document.getElementById('result').style.display = 'block';
       document.getElementById('preview').src = '/api/preview/'+jid;
       document.getElementById('download_link').href = '/api/download/'+jid;
+    } else if(d.status === "error"){
+      clearInterval(int);
+      alert("Error: " + (d.error || "Processing failed"));
     }
   },1500);
 }
