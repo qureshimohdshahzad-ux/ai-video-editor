@@ -2,8 +2,8 @@ services:
   - type: web
     name: ai-video-editor
     runtime: python
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1"
+    buildCommand: "apt-get update && apt-get install -y ffmpeg fonts-dejavu-core fonts-liberation && pip install -r requirements.txt"
+    startCommand: "gunicorn app:app --bind 0.0.0.0:$PORT"
     envVars:
       - key: GROQ_API_KEY
         sync: false
